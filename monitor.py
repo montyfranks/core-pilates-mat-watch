@@ -14,6 +14,7 @@ Settings come from environment variables (set in the GitHub workflow):
 import json
 import os
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -29,10 +30,48 @@ TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 LONDON = ZoneInfo("Europe/London")
 
 
+HEALTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "health.json")
+ALERT_AFTER = 12  # consecutive failed checks (~1 hour) before the run is marked failed
+
+
 def fetch_classes():
-    req = urllib.request.Request(FEED_URL, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+    """Fetch the feed, retrying a few times so a brief website blip doesn't count as a failure."""
+    last_err = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(FEED_URL, headers={"User-Agent": UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.load(r)
+            if not isinstance(data, list):
+                raise ValueError("feed did not return a list of classes")
+            return data
+        except Exception as e:
+            last_err = e
+            print(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(5 * (attempt + 1))
+    raise last_err
+
+
+def load_failures():
+    try:
+        with open(HEALTH_FILE) as f:
+            return int(json.load(f).get("consecutive_failures", 0))
+    except Exception:
+        return 0
+
+
+def save_failures(n):
+    if n == load_failures():
+        return
+    if n == 0:
+        try:
+            os.remove(HEALTH_FILE)
+        except FileNotFoundError:
+            pass
+        return
+    with open(HEALTH_FILE, "w") as f:
+        json.dump({"consecutive_failures": n}, f)
+        f.write("\n")
 
 
 def matches(c):
@@ -128,6 +167,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+        save_failures(0)
     except Exception as e:
-        print("Check failed:", e, file=sys.stderr)
-        sys.exit(1)
+        n = load_failures() + 1
+        save_failures(n)
+        print(f"Check failed ({n} in a row): {e}", file=sys.stderr)
+        # Stay quiet for short outages; only mark the run failed (which emails you)
+        # once it has been failing for about an hour, then every ~6 hours after.
+        if n == ALERT_AFTER or (n > ALERT_AFTER and (n - ALERT_AFTER) % 72 == 0):
+            sys.exit(1)
